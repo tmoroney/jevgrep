@@ -13,6 +13,8 @@ dist/
 !/evals/implementation/
 /evals/implementation/*
 !/evals/implementation/swebench/
+# Retrieval-precision diagnostic for Jev request designs; generated pairs and answers stay in evals/runs/.
+!/evals/implementation/retrieval-pairs/
 __pycache__/
 
 # Deprecated personal-repository evaluation tooling stays local.
