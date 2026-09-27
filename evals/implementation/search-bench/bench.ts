@@ -43,6 +43,9 @@ const { values } = parseArgs({
     "max-jev-usd": { type: "string", default: "0.45" },
     threshold: { type: "string", default: "0.5" },
     "agent-model": { type: "string", default: "openai/gpt-oss-120b" },
+    "agent-effort": { type: "string", default: "low" },
+    // Stored as <tool>-<label>, so runs with another model sit beside the default ones.
+    label: { type: "string" },
     keep: { type: "boolean", default: false },
     report: { type: "boolean", default: false },
   },
@@ -344,7 +347,7 @@ async function runPlanAgent(root: string, query: string, hints = false) {
       model: values["agent-model"]!,
       messages,
       response_format: { type: "json_object" },
-      reasoning: { effort: "low" },
+      reasoning: { effort: values["agent-effort"] },
       max_tokens: 4000,
     });
     usd += response.cost;
@@ -401,7 +404,7 @@ async function runAgent(root: string, query: string) {
       tools: final ? [answerTool] : [...agentTools, answerTool],
       tool_choice: final ? "required" : "auto",
       parallel_tool_calls: true,
-      reasoning: { effort: "low" },
+      reasoning: { effort: values["agent-effort"] },
       max_tokens: 4000,
     });
     usd += response.cost;
@@ -464,6 +467,8 @@ const tools: Record<string, (root: string, query: string) => Promise<Omit<Result
 
 // ---------- runner ----------
 
+const stored = (name: string) => (values.label ? `${name}-${values.label}` : name);
+
 function chooseTasks(): Task[] {
   if (values.tasks) return values.tasks.split(",").map((id) => tasks.find((t) => t.instance_id === id)!);
   if (values.sample) {
@@ -482,7 +487,7 @@ async function run() {
   await mkdir(`${runDir}/results`, { recursive: true });
   const done = new Map<string, Set<string>>();
   for (const name of names)
-    done.set(name, new Set((await readJsonl<Result>(`${runDir}/results/${name}.jsonl`)).map((r) => r.instance_id)));
+    done.set(name, new Set((await readJsonl<Result>(`${runDir}/results/${stored(name)}.jsonl`)).map((r) => r.instance_id)));
   for (const task of selected) {
     const pending = names.filter((name) => !done.get(name)!.has(task.instance_id));
     if (!pending.length) continue;
@@ -504,7 +509,7 @@ async function run() {
         const { output, ...rest } = await tools[name]!(root, query);
         row = {
           instance_id: task.instance_id,
-          tool: name,
+          tool: stored(name),
           query,
           ...rest,
           outputChars: output.length,
@@ -522,10 +527,10 @@ async function run() {
           error: error instanceof Error ? error.message.slice(0, 500) : String(error),
         };
       }
-      await appendFile(`${runDir}/results/${name}.jsonl`, JSON.stringify(row) + "\n");
+      await appendFile(`${runDir}/results/${stored(name)}.jsonl`, JSON.stringify(row) + "\n");
       const s = score(task, row);
       console.log(
-        `${task.instance_id.padEnd(36)} ${name.padEnd(6)} edit ${pct(s.editRecall)} test ${pct(s.testRecall)} prec ${pct(s.precision)} ` +
+        `${task.instance_id.padEnd(36)} ${stored(name).padEnd(16)} edit ${pct(s.editRecall)} test ${pct(s.testRecall)} prec ${pct(s.precision)} ` +
           `${String(row.snippets.length).padStart(2)} snip ${Math.round(row.outputChars / 4).toString().padStart(6)} tok $${row.toolUsd.toFixed(4)} ${row.seconds.toFixed(1)}s` +
           (row.status && row.status !== "complete" ? ` [${row.status}]` : "") +
           (row.error ? ` ERROR ${row.error.slice(0, 120)}` : ""),
@@ -568,7 +573,8 @@ const median = (xs: number[]) => {
 
 async function report() {
   const byTool = new Map<string, Result[]>();
-  for (const name of Object.keys(tools)) {
+  const files = (await readdir(`${runDir}/results`)).filter((f) => f.endsWith(".jsonl")).sort();
+  for (const name of files.map((f) => f.slice(0, -".jsonl".length))) {
     const rows = await readJsonl<Result>(`${runDir}/results/${name}.jsonl`);
     if (rows.length) byTool.set(name, rows);
   }
@@ -583,7 +589,7 @@ async function report() {
   const table = (title: string, filter: (r: Result) => boolean) => {
     console.log(`\n${title}`);
     console.log(
-      "tool    tasks  found edit  edit recall  edit file  test recall  precision  in gold file  snippets  tokens to agent  tool $/search  seconds",
+      "tool             tasks  found edit  edit recall  edit file  test recall  precision  in gold file  snippets  tokens to agent  tool $/search  seconds",
     );
     for (const [name, rows] of byTool) {
       const scored = rows.filter((r) => !r.error && filter(r)).map((r) => ({ r, s: score(tasks.find((t) => t.instance_id === r.instance_id)!, r) }));

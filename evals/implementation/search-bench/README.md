@@ -72,6 +72,25 @@ Each tool on every task it finished:
   search added) gives about $0.08 for Opus to search itself, against about $0.02
   for delegating to `rerank` or `agent-bm25` and $0.10 for `jg`.
 
+### Qwen 3.8 27B on Cerebras (direct API)
+
+On the 34 tasks every agent variant and `rerank` finished. `low` and `none` are
+Cerebras `reasoning_effort` values; GPT-OSS ran at `low` through OpenRouter.
+Qwen costs are estimated at $0.99/$1.49 per million tokens, since Cerebras
+responses carry no price.
+
+| Tool | found edit | precision | output tokens | seconds (median / p90) | $/search |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| agent, GPT-OSS-120B low | 21/34 | 45% | 471 | 2.1 / 2.6 | $0.0051 |
+| agent, Qwen low | 24/34 | 57% | 716 | 1.8 / 2.3 | $0.0092 |
+| agent, Qwen none | 20/34 | 55% | 256 | 1.5 / 2.2 | $0.0080 |
+| agent-bm25, GPT-OSS-120B low | 24/34 | 52% | 473 | 3.2 / 5.6 | $0.0042 |
+| agent-bm25, Qwen low | 24/34 | 51% | 694 | 2.9 / 4.6 | $0.0085 |
+| agent-bm25, Qwen none | 24/34 | 48% | 245 | 2.4 / 4.3 | $0.0084 |
+| rerank | 20/34 | 64% | n/a | 1.9 / 4.1 | $0.0009 |
+
+`agent-bm25` times include about a second of local BM25 in Python.
+
 Samples are small: treat differences of one or two tasks as noise.
 
 ## Running
@@ -85,7 +104,9 @@ bun evals/implementation/search-bench/bench.ts --tools agent,agent-bm25   # OPEN
 bun evals/implementation/search-bench/bench.ts --report
 ```
 
-`--agent-model cerebras/<model>` calls Cerebras directly with `CEREBRAS_API_KEY`.
+`--agent-model cerebras/qwen-3.8-27b` calls Cerebras directly with `CEREBRAS_API_KEY`;
+`--agent-effort low|none` sets its reasoning effort and `--label` stores the run as
+`<tool>-<label>` beside the default results.
 Results append to `evals/runs/search-bench/results/<tool>.jsonl` and reruns skip
 finished tasks. Jev spend accumulates in `evals/runs/search-bench/jev-ledger.json`,
 and `--max-jev-usd` caps it across runs.

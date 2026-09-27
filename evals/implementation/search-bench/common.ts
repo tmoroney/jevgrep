@@ -45,8 +45,14 @@ export async function chat(body: Record<string, unknown> & { model: string }) {
     : "https://openrouter.ai/api/v1/chat/completions";
   const key = direct ? process.env.CEREBRAS_API_KEY : process.env.OPENROUTER_API_KEY;
   if (!key) throw new Error(direct ? "Set CEREBRAS_API_KEY" : "Set OPENROUTER_API_KEY");
+  // Cerebras takes a flat reasoning_effort instead of OpenRouter's reasoning object.
+  const { reasoning, ...rest } = body as typeof body & { reasoning?: { effort?: string } };
   const request = direct
-    ? { ...body, model: body.model.slice("cerebras/".length) }
+    ? {
+        ...rest,
+        model: body.model.slice("cerebras/".length),
+        ...(reasoning?.effort ? { reasoning_effort: reasoning.effort } : {}),
+      }
     : {
         ...body,
         usage: { include: true },
