@@ -1,155 +1,93 @@
 /**
- * Experimental request builders that follow TypeSafe's jev-1.13 guidance
- * (docs.typesafe.ai/model-jaggedness/jev-1.13). Not wired into retrieve() yet;
- * evals/implementation/retrieval-pairs compares them with the current requests.
+ * Experimental Jev request builders for re-ranking code candidates against a search
+ * query. They follow TypeSafe's jev-1.13 guidance (docs.typesafe.ai/model-jaggedness/jev-1.13)
+ * and its re-ranking and line-search cookbooks. Not wired into retrieve() yet;
+ * evals/implementation/search-bench compares them with the current pipeline.
  *
- * - Small state: one task and the block(s) being judged, nothing else (#5).
- * - Name the state field each question reads, e.g. `block.source` (#4).
+ * - Small state: the query and the candidate(s) being judged, nothing else (#5).
+ * - Questions name the state field they read, e.g. `candidate.source` (#4).
  * - One literal judgment per question, with boundary cases in criteria (#1).
- * - No line numbers or counting asked of the model; blocks arrive pre-cut (#2).
- * - Lexical facts code can compute (does the task name this symbol?) stay in code.
- * - Choice ranks a shortlist; separate Nouls decide absolute relevance (#8).
+ * - No line numbers or counting asked of the model; candidates arrive pre-cut (#2).
+ * - Lexical facts code can compute (does the query name this symbol?) stay in code.
+ * - A Choice ranks a shortlist; a separate Noul decides absolute relevance (#8).
  */
 
-export type Block = { path: string; name: string; source: string };
-export type Facets = {
-  /** One concrete behavior, e.g. "computes the Content-Length header for a request". */
-  behavior: string;
-  /** Optional description of a test that would exercise the behavior. */
-  test?: string;
-};
+export type Candidate = { path: string; name: string; source: string };
 type Text = string;
 export type LiteralQuestion =
-  | {
-      type: "boolean";
-      instructions: Text;
-      criteria?: { true?: Text; false?: Text };
-    }
+  | { type: "boolean"; instructions: Text; criteria?: { true?: Text; false?: Text } }
   | { type: "choice"; instructions: Text; criteria: Record<string, Text | null> };
 export type LiteralRequest = {
   state: Record<string, unknown>;
   questions: Record<string, LiteralQuestion>;
 };
 
-const blockState = (block: Block) => ({ path: block.path, name: block.name, source: block.source });
+const candidateState = (candidate: Candidate) => ({
+  path: candidate.path,
+  name: candidate.name,
+  source: candidate.source,
+});
 
-/** Judgments available for one block against a free-text task description. */
-export const taskJudgments = {
-  edit: {
-    type: "boolean",
-    instructions:
-      "Would a fix for the problem described in `task.description` change at least one line of `block.source`?",
-    criteria: {
-      true: "The fix edits, adds, or removes a line inside `block.source`.",
-      false:
-        "The fix is made in other code. `block.source` stays unchanged even if it calls, tests, or resembles the changed code.",
-    },
+export const matchQuestion = {
+  type: "boolean",
+  instructions: "Is `candidate.source` the code that `search.query` asks to find?",
+  criteria: {
+    true: "`candidate.source` defines, performs, or directly tests the behavior that `search.query` asks about.",
+    false:
+      "`candidate.source` only calls that code, shares words with `search.query`, or handles a different case.",
   },
-  behavior: {
-    type: "boolean",
-    instructions:
-      "Does `block.source` contain the statements that produce the behavior described in `task.description`?",
-    criteria: {
-      true: "The statements in `block.source` compute the value or perform the action that `task.description` describes.",
-      false:
-        "`block.source` only calls that code, wraps it, tests it, or uses the same words for something else.",
-    },
-  },
-  test: {
-    type: "boolean",
-    instructions:
-      "Is `block.source` a test that exercises the behavior described in `task.description`?",
-    criteria: {
-      true: "`block.source` is a test function or test class, and its assertions check that behavior.",
-      false: "`block.source` is not a test, or it tests a different behavior.",
-    },
-  },
-} as const satisfies Record<string, LiteralQuestion>;
-export type TaskJudgment = keyof typeof taskJudgments;
+} as const satisfies LiteralQuestion;
 
-/** One block, one task, and only the judgments asked for. Output is free, so asking several shares the input cost. */
-export function blockRequest(
-  description: string,
-  block: Block,
-  judgments: readonly TaskJudgment[] = ["edit", "behavior", "test"],
-): LiteralRequest {
+/** One query and one candidate: the re-ranking cookbook's pair request. Sort candidates by its noul. */
+export function candidateRequest(query: string, candidate: Candidate): LiteralRequest {
   return {
-    state: { task: { description }, block: blockState(block) },
-    questions: Object.fromEntries(judgments.map((id) => [id, taskJudgments[id]])),
+    state: { search: { query }, candidate: candidateState(candidate) },
+    questions: { match: matchQuestion },
   };
-}
-
-/**
- * Facets move the indirection ("where would this bug be fixed?") to the caller,
- * which is a generative model. Jev only checks a literal description against a block.
- */
-export function facetRequest(facets: Facets, block: Block): LiteralRequest {
-  const questions: Record<string, LiteralQuestion> = {
-    behavior: {
-      type: "boolean",
-      instructions: "Does `block.source` contain the statements that perform `facet.behavior`?",
-      criteria: {
-        true: "The statements in `block.source` carry out `facet.behavior` themselves.",
-        false:
-          "`block.source` only calls, wraps, or configures that code, or uses the same words for something else.",
-      },
-    },
-  };
-  if (facets.test !== undefined)
-    questions.test = {
-      type: "boolean",
-      instructions: "Is `block.source` a test that matches `facet.test`?",
-      criteria: {
-        true: "`block.source` is a test function or test class, and its assertions check what `facet.test` describes.",
-        false: "`block.source` is not a test, or it checks something else.",
-      },
-    };
-  return { state: { facet: facets, block: blockState(block) }, questions };
 }
 
 /** Choice supports at most 255 options; one is reserved for "none". */
 export const maxShortlist = 254;
 
 /**
- * Relative ranking over a shortlist, plus an absolute gate in the same request.
- * The Choice picks which candidate is most likely; the Noul decides whether any is.
- * Their probabilities are not comparable to each other or to per-block Nouls.
+ * Relative ranking over a shortlist plus an absolute gate in the same request, as in the
+ * line-search cookbook. Choice probabilities sum to one, so the Noul decides whether any
+ * candidate is relevant; neither is comparable to the per-candidate noul.
  */
-export function shortlistRequest(description: string, blocks: Block[]): LiteralRequest {
-  if (!blocks.length || blocks.length > maxShortlist)
+export function shortlistRequest(query: string, candidates: Candidate[]): LiteralRequest {
+  if (!candidates.length || candidates.length > maxShortlist)
     throw new RangeError(`Shortlist size must be 1-${maxShortlist}`);
-  const candidates = Object.fromEntries(blocks.map((block, i) => [`c${i}`, blockState(block)]));
   return {
-    state: { task: { description }, candidates },
+    state: {
+      search: { query },
+      candidates: Object.fromEntries(candidates.map((c, i) => [`c${i}`, candidateState(c)])),
+    },
     questions: {
       pick: {
         type: "choice",
-        instructions:
-          "Which entry of `candidates` would a fix for the problem described in `task.description` change?",
+        instructions: "Which entry of `candidates` is the code that `search.query` asks to find?",
         criteria: {
-          ...Object.fromEntries(
-            blocks.map((block, i) => [
-              `c${i}`,
-              `\`candidates.c${i}\`: ${block.name} in ${block.path}`,
-            ]),
-          ),
-          none: "The fix changes none of the entries in `candidates`.",
+          ...Object.fromEntries(candidates.map((_, i) => [`c${i}`, null])),
+          none: "No entry of `candidates` is the code that `search.query` asks to find.",
         },
       },
       any: {
         type: "boolean",
-        instructions:
-          "Would a fix for the problem described in `task.description` change at least one entry of `candidates`?",
+        instructions: "Is any entry of `candidates` the code that `search.query` asks to find?",
+        criteria: {
+          true: "At least one entry defines, performs, or directly tests what `search.query` asks about.",
+          false: "Entries only call that code, share words with the query, or handle other cases.",
+        },
       },
     },
   };
 }
 
 /** Lexical evidence computed in code instead of asked of the model. */
-export function namesSymbol(description: string, block: Block) {
-  const leaf = block.name.split(".").at(-1)!;
+export function namesSymbol(query: string, candidate: Candidate) {
+  const leaf = candidate.name.split(".").at(-1)!;
   return (
     leaf.length > 2 &&
-    new RegExp(`\\b${leaf.replace(/[$^\\.*+?()[\]{}|]/g, "\\$&")}\\b`).test(description)
+    new RegExp(`\\b${leaf.replace(/[$^\\.*+?()[\]{}|]/g, "\\$&")}\\b`).test(query)
   );
 }
