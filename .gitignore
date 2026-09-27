@@ -13,6 +13,8 @@ dist/
 !/evals/implementation/
 /evals/implementation/*
 !/evals/implementation/swebench/
+# Code-search benchmark tooling; generated tasks, checkouts and results stay in evals/runs/.
+!/evals/implementation/search-bench/
 __pycache__/
 
 # Deprecated personal-repository evaluation tooling stays local.

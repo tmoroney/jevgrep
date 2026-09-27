@@ -44,6 +44,18 @@
         "@types/node": "22",
       },
     },
+    "packages/fast-context": {
+      "name": "@repo/fast-context",
+      "version": "0.0.0",
+      "bin": {
+        "fast-context": "./src/cli.ts",
+      },
+      "devDependencies": {
+        "@repo/typescript-config": "workspace:*",
+        "@types/node": "22",
+        "typescript": "catalog:",
+      },
+    },
     "packages/typescript-config": {
       "name": "@repo/typescript-config",
       "version": "0.0.0",
@@ -145,6 +157,8 @@
     "@oxlint/binding-win32-x64-msvc": ["@oxlint/binding-win32-x64-msvc@1.72.0", "", { "os": "win32", "cpu": "x64" }, "sha512-b2eKFD2hX7tIwmo/cyH6TDq8vzWRZ2qNHrzoGntUTmq0h3zQh/uX3eTSHCwI8OB/ADQfJCRelLItK8BsxuucDA=="],
 
     "@repo/core": ["@repo/core@workspace:packages/core"],
+
+    "@repo/fast-context": ["@repo/fast-context@workspace:packages/fast-context"],
 
     "@repo/typescript-config": ["@repo/typescript-config@workspace:packages/typescript-config"],
 

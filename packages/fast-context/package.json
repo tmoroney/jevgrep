@@ -1,0 +1,21 @@
+{
+  "name": "@repo/fast-context",
+  "version": "0.0.0",
+  "private": true,
+  "bin": {
+    "fast-context": "./src/cli.ts"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./src/fast-context.ts"
+  },
+  "scripts": {
+    "check-types": "tsc --noEmit",
+    "lint": "oxlint src"
+  },
+  "devDependencies": {
+    "@repo/typescript-config": "workspace:*",
+    "@types/node": "22",
+    "typescript": "catalog:"
+  }
+}
