@@ -5,6 +5,7 @@
     "packages": [
       "apps/*",
       "packages/core",
+      "packages/fast-context",
       "packages/typescript-config"
     ],
     "catalog": {

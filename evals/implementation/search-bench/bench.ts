@@ -12,12 +12,8 @@
  *   rerank  BM25 top 30, then one Jev Noul per candidate (TypeSafe's re-ranking cookbook);
  *           keeps candidates above --threshold, at most 8.
  *   jg      the current jevgrep pipeline, in process, with its stdout rendering.
- *   agent   SWE-grep-style subagent without RL: each turn a fast LLM returns a JSON batch of
- *           up to 8 grep/read/list actions that the harness runs in parallel; it must answer
- *           with line ranges by turn 4. The harness, not the model, enforces the fan-out.
+ *   agent   the fast-context agent from packages/fast-context (--agent-model, --agent-effort).
  *   agent-bm25    agent, plus the top 15 BM25 declarations as starting hints.
- *   agent-native  the same tools through native tool calling, where the model decides how many
- *           calls to make per turn (kept to show that untrained models barely parallelize).
  *
  * Results append to evals/runs/search-bench/results/<tool>.jsonl; reruns skip finished tasks.
  * Jev spend is recorded in evals/runs/search-bench/jev-ledger.json and capped across runs.
@@ -27,11 +23,12 @@ import { experimental_evaluate as evaluate } from "../../../packages/core/node_m
 import { retrieve, createEvaluator } from "../../../packages/core/src/index";
 import { candidateRequest } from "../../../packages/core/src/literal-requests";
 import { renderResult } from "../../../apps/cli/src/render";
-import { chat, jevLedger, readJsonl, runDir, type ChatMessage, type Task } from "./common";
+import { findContext, type Endpoint } from "../../../packages/fast-context/src/fast-context";
+import { jevLedger, readJsonl, runDir, type Task } from "./common";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, readFile, readdir, rm, stat } from "node:fs/promises";
-import { join, normalize, resolve } from "node:path";
+import { appendFile, mkdir, readFile, readdir, rm } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 
 const { values } = parseArgs({
@@ -185,284 +182,61 @@ async function runJg(root: string, query: string) {
   };
 }
 
-const agentTools = [
-  {
-    type: "function",
-    function: {
-      name: "grep",
-      description:
-        "Search file contents with a ripgrep regex. Returns up to 40 matching lines as path:line:text.",
-      parameters: {
-        type: "object",
-        properties: {
-          pattern: { type: "string", description: "Rust regex, e.g. 'def prepare_body|Content-Length'" },
-          glob: { type: "string", description: "Optional file glob, e.g. '*.py' or 'src/**/models.py'" },
-        },
-        required: ["pattern"],
-      },
+/** Endpoint for the fast-context agent: `cerebras/<model>` direct, anything else via OpenRouter. */
+function agentEndpoint(): Partial<Endpoint> {
+  const model = values["agent-model"]!;
+  const reasoningEffort = values["agent-effort"] as Endpoint["reasoningEffort"];
+  if (model.startsWith("cerebras/"))
+    return { model: model.slice("cerebras/".length), reasoningEffort };
+  const key = process.env.OPENROUTER_API_KEY;
+  if (!key) throw new Error("Set OPENROUTER_API_KEY");
+  return {
+    baseURL: "https://openrouter.ai/api/v1",
+    apiKey: key,
+    model,
+    reasoningEffort,
+    extraBody: {
+      usage: { include: true },
+      ...(model === "openai/gpt-oss-120b"
+        ? { provider: { order: ["Cerebras"], allow_fallbacks: false } }
+        : {}),
     },
-  },
-  {
-    type: "function",
-    function: {
-      name: "read",
-      description: "Read up to 120 lines of a file, with line numbers.",
-      parameters: {
-        type: "object",
-        properties: {
-          path: { type: "string" },
-          start_line: { type: "integer" },
-          end_line: { type: "integer" },
-        },
-        required: ["path", "start_line", "end_line"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "list",
-      description: "List a directory's entries (up to 100).",
-      parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
-    },
-  },
-] as const;
-const answerTool = {
-  type: "function",
-  function: {
-    name: "answer",
-    description:
-      "Return the code the question asks for: at most 6 line ranges, each at most 80 lines, most relevant first.",
-    parameters: {
-      type: "object",
-      properties: {
-        snippets: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              path: { type: "string" },
-              start_line: { type: "integer" },
-              end_line: { type: "integer" },
-            },
-            required: ["path", "start_line", "end_line"],
-          },
-        },
-      },
-      required: ["snippets"],
-    },
-  },
-} as const;
-const agentSystem = `You are a fast code-search subagent. Another coding agent asked you a question about this repository; find the code it needs and return exact line ranges.
-Work in parallel: each turn, issue several tool calls at once (up to 8), e.g. multiple grep patterns for different names, then read the most promising hits.
-You have at most 3 turns of searching. By your 4th turn you must call answer.
-Return only code that directly answers the question: the definitions that implement the behavior and tests of it. Precision matters more than recall; every extra snippet costs the other agent context. Do not return imports, unrelated helpers, or whole files.`;
-
-function inside(root: string, path: string) {
-  const full = normalize(join(root, path));
-  if (!full.startsWith(root)) throw new Error("path outside repository");
-  return full;
-}
-async function runAgentTool(root: string, name: string, args: Record<string, unknown>) {
-  try {
-    if (name === "grep") {
-      const rg = spawnSync(
-        "rg",
-        [
-          "-n",
-          "--no-heading",
-          "-S",
-          "--max-count",
-          "5",
-          "--max-columns",
-          "200",
-          ...(args.glob ? ["-g", String(args.glob)] : []),
-          "-e",
-          String(args.pattern),
-          ".",
-        ],
-        { cwd: root, maxBuffer: 1 << 26 },
-      );
-      const lines = rg.stdout.toString().split("\n").filter(Boolean);
-      return (
-        lines
-          .slice(0, 40)
-          .map((l) => l.replace(/^\.\//, ""))
-          .join("\n") +
-        (lines.length > 40 ? `\n[${lines.length - 40} more matches]` : "") ||
-        rg.stderr.toString().slice(0, 300) ||
-        "no matches"
-      );
-    }
-    if (name === "read") {
-      const lines = (await readFile(inside(root, String(args.path)), "utf8")).split("\n");
-      const start = Math.max(1, Number(args.start_line) || 1);
-      const end = Math.min(lines.length, Number(args.end_line) || start + 119, start + 119);
-      return lines
-        .slice(start - 1, end)
-        .map((l, i) => `${start + i}: ${l}`)
-        .join("\n");
-    }
-    if (name === "list") {
-      const dir = inside(root, String(args.path ?? "."));
-      const entries = await readdir(dir, { withFileTypes: true });
-      return entries
-        .slice(0, 100)
-        .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
-        .join("\n");
-    }
-    return `unknown tool ${name}`;
-  } catch (error) {
-    return `error: ${error instanceof Error ? error.message : error}`;
-  }
+  };
 }
 
-const planSystem = `You are a fast code-search subagent. Another coding agent asked you a question about this repository; find the code it needs and return exact line ranges.
-You work in at most 4 turns. Every turn, reply with one JSON object and nothing else:
-{"actions": [ ... ], "answer": null}   or   {"actions": [], "answer": [{"path": "...", "start_line": 1, "end_line": 40}]}
-Actions run in parallel, so batch them. Each action is one of:
-  {"tool": "grep", "pattern": "<ripgrep regex>", "glob": "<optional glob such as *.py>"}   -> up to 40 matching lines as path:line:text
-  {"tool": "read", "path": "<file>", "start_line": N, "end_line": M}                      -> up to 120 numbered lines
-  {"tool": "list", "path": "<directory>"}                                                -> directory entries
-Turn 1: issue 6 to 8 greps at once, covering different names, spellings and phrases from the question (function names, class names, option strings, error text).
-Turn 2: issue up to 8 actions, mostly reads of the most promising grep hits, plus greps for names you discovered.
-Turn 3: answer if you have found the code, otherwise up to 8 more actions.
-Turn 4: you must answer.
-The answer lists at most 6 ranges, most relevant first, each at most 80 lines: the definitions that implement what the question asks about, and tests of it. Precision matters more than recall; every extra range costs the other agent context. Never answer with a range you have not seen in a read or grep result.`;
-
-async function runPlanAgent(root: string, query: string, hints = false) {
-  let intro = `Repository root listing:\n${await runAgentTool(root, "list", { path: "." })}`;
-  if (hints)
-    intro += `\n\nTop local keyword matches for the question (declaration, path:lines), which may or may not be relevant:\n${bm25(root, query, 15)
-      .map((b) => `${b.name}  ${b.path}:${b.start_line}-${b.end_line}`)
-      .join("\n")}`;
-  const messages: ChatMessage[] = [
-    { role: "system", content: planSystem },
-    { role: "user", content: `${intro}\n\nQuestion: ${query}\n\nTurn 1 of 4.` },
-  ];
-  const trace: NonNullable<Result["trace"]> = [];
-  let usd = 0;
-  for (let turn = 0; turn < 4; turn++) {
-    const response = await chat({
-      model: values["agent-model"]!,
-      messages,
-      response_format: { type: "json_object" },
-      reasoning: { effort: values["agent-effort"] },
-      max_tokens: 4000,
-    });
-    usd += response.cost;
-    messages.push({ role: "assistant", content: response.content ?? "" });
-    let plan: {
-      actions?: Array<Record<string, unknown>>;
-      answer?: Array<{ path: string; start_line: number; end_line: number }> | null;
-    } = {};
-    try {
-      plan = JSON.parse(response.content ?? "{}");
-    } catch {}
-    const actions = (plan.actions ?? []).slice(0, 8);
-    if (plan.answer?.length || turn === 3) {
-      trace.push({ calls: 0, toolOutputChars: 0, inputTokens: response.inputTokens, outputTokens: response.outputTokens });
-      const snippets: Snippet[] = [];
-      for (const s of (plan.answer ?? []).slice(0, 6)) {
-        const path = String(s.path).replace(/^\.\//, "");
-        try {
-          if (!(await stat(inside(root, path))).isFile()) continue;
-        } catch {
-          continue;
+async function runFastContext(root: string, query: string, hints = false) {
+  const result = await findContext({
+    root,
+    question: query,
+    endpoint: agentEndpoint(),
+    ...(hints
+      ? {
+          hints: bm25(root, query, 15).map(
+            (b) => `${b.name}  ${b.path}:${b.start_line}-${b.end_line}`,
+          ),
         }
-        const startLine = Math.max(1, Math.floor(s.start_line));
-        snippets.push({ path, startLine, endLine: Math.max(startLine, Math.floor(s.end_line)) });
-      }
-      return { snippets, output: await render(root, snippets), toolUsd: usd, trace, ...(snippets.length ? {} : { status: "no-answer" }) };
-    }
-    const outputs = await Promise.all(actions.map((a) => runAgentTool(root, String(a.tool), a)));
-    const toolOutputChars = outputs.reduce((n, o) => n + o.length, 0);
-    trace.push({ calls: actions.length, toolOutputChars, inputTokens: response.inputTokens, outputTokens: response.outputTokens });
-    messages.push({
-      role: "user",
-      content:
-        (actions.length
-          ? actions.map((a, i) => `### ${i + 1}. ${JSON.stringify(a)}\n${outputs[i]}`).join("\n\n")
-          : "No actions were given.") + `\n\nTurn ${turn + 2} of 4.${turn + 2 === 4 ? " You must answer now." : ""}`,
-    });
-  }
-  return { snippets: [], output: "", toolUsd: usd, trace, status: "no-answer" };
-}
-
-async function runAgent(root: string, query: string) {
-  const messages: ChatMessage[] = [
-    { role: "system", content: agentSystem },
-    { role: "user", content: `Repository root listing:\n${await runAgentTool(root, "list", { path: "." })}\n\nQuestion: ${query}` },
-  ];
-  const trace: NonNullable<Result["trace"]> = [];
-  let usd = 0;
-  for (let turn = 0; turn < 4; turn++) {
-    const final = turn === 3;
-    const response = await chat({
-      model: values["agent-model"]!,
-      messages,
-      tools: final ? [answerTool] : [...agentTools, answerTool],
-      tool_choice: final ? "required" : "auto",
-      parallel_tool_calls: true,
-      reasoning: { effort: values["agent-effort"] },
-      max_tokens: 4000,
-    });
-    usd += response.cost;
-    const calls = response.message.tool_calls ?? [];
-    messages.push({ role: "assistant", content: response.message.content ?? "", tool_calls: calls });
-    const answer = calls.find((c) => c.function.name === "answer");
-    let toolOutputChars = 0;
-    if (!answer) {
-      if (!calls.length)
-        messages.push({ role: "user", content: "Call tools, or call answer if you have found the code." });
-      const outputs = await Promise.all(
-        calls.map((c) => {
-          let args: Record<string, unknown> = {};
-          try {
-            args = JSON.parse(c.function.arguments || "{}");
-          } catch {}
-          return runAgentTool(root, c.function.name, args);
-        }),
-      );
-      calls.forEach((c, i) => {
-        toolOutputChars += outputs[i]!.length;
-        messages.push({ role: "tool", tool_call_id: c.id, content: outputs[i]! });
-      });
-    }
-    trace.push({
-      calls: calls.length,
-      toolOutputChars,
-      inputTokens: response.inputTokens,
-      outputTokens: response.outputTokens,
-    });
-    if (answer) {
-      const parsed = JSON.parse(answer.function.arguments || "{}") as {
-        snippets?: Array<{ path: string; start_line: number; end_line: number }>;
-      };
-      const snippets: Snippet[] = [];
-      for (const s of (parsed.snippets ?? []).slice(0, 6)) {
-        const path = s.path.replace(/^\.\//, "");
-        try {
-          if (!(await stat(inside(root, path))).isFile()) continue;
-        } catch {
-          continue;
-        }
-        const startLine = Math.max(1, Math.floor(s.start_line));
-        snippets.push({ path, startLine, endLine: Math.max(startLine, Math.floor(s.end_line)) });
-      }
-      return { snippets, output: await render(root, snippets), toolUsd: usd, trace };
-    }
-  }
-  return { snippets: [], output: "", toolUsd: usd, trace, status: "no-answer" };
+      : {}),
+  });
+  return {
+    snippets: result.snippets.map(({ path, startLine, endLine }) => ({ path, startLine, endLine })),
+    output: result.text,
+    toolUsd: result.usage.usd,
+    trace: result.trace.map((t) => ({
+      calls: t.actions,
+      toolOutputChars: t.toolOutputChars,
+      inputTokens: t.inputTokens,
+      outputTokens: t.outputTokens,
+    })),
+    ...(result.status === "answered" ? {} : { status: result.status }),
+  };
 }
 
 const tools: Record<string, (root: string, query: string) => Promise<Omit<Result, "instance_id" | "tool" | "query" | "seconds" | "outputChars"> & { output: string }>> = {
   bm25: runBm25,
   rerank: runRerank,
   jg: runJg,
-  "agent-native": runAgent,
-  agent: (root, query) => runPlanAgent(root, query),
-  "agent-bm25": (root, query) => runPlanAgent(root, query, true),
+  agent: (root, query) => runFastContext(root, query),
+  "agent-bm25": (root, query) => runFastContext(root, query, true),
 };
 
 // ---------- runner ----------

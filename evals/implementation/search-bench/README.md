@@ -27,9 +27,14 @@ answer key.
 | `bm25` | Local keyword ranking over every Python declaration; top 8. Free. |
 | `rerank` | BM25 top 30, then one Jev Noul per (query, candidate) pair as in TypeSafe's re-ranking cookbook, using `candidateRequest` from `packages/core/src/literal-requests.ts`; keeps scores above 0.5, at most 8. |
 | `jg` | The current jevgrep pipeline in process, with its stdout rendering. |
-| `agent` | SWE-grep-style subagent without RL: each turn GPT-OSS-120B on Cerebras returns a JSON batch of up to 8 grep/read/list actions that the harness runs in parallel; it must answer with line ranges by turn 4. |
+| `agent` | The fast-context agent in [`packages/fast-context`](../../../packages/fast-context/README.md): each turn the model returns a JSON batch of up to 8 grep/read/list actions that the harness runs in parallel, and it must answer with line ranges by turn 4. `--agent-model` and `--agent-effort` pick the model. |
 | `agent-bm25` | `agent` plus the top 15 BM25 declarations as starting hints. |
-| `agent-native` | The same tools through native tool calling. The model made one call per turn, so the harness now enforces the fan-out instead. |
+
+An earlier native tool-calling agent was dropped: GPT-OSS made one tool call per
+turn, finding the edit in 6 of 12 tasks (`agent-native` in older result files).
+Results recorded before the agent moved into its own package returned snippets
+without line numbers, so their token counts are slightly lower than the
+package's numbered output.
 
 ## Scores
 
